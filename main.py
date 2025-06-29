@@ -4,9 +4,11 @@ main.py: Automatically generate a Verilog testbench for a given module using Pyv
 Usage: python3 main.py design.v
 The generated testbench is appended to the end of design.v.
 """
+import itertools
 
 import sys
-import itertools
+from itertools import product
+
 from pyverilog.vparser.parser import parse, ParseError
 from pyverilog.vparser.ast import ModuleDef, Ioport, Input, Output
 from senstivity_check import check_sensitivity, report_warnings
@@ -67,12 +69,13 @@ def extract_ports(module, params):
     for port in module.portlist.ports:
         decl = port.first
         name = decl.name
-        # resolve_width now returns (width_str, bit_width)
         width_str, bit_width = resolve_width(decl.width, params)
+        is_signed = getattr(decl, 'signed', False)
+        entry = (name, width_str, bit_width, is_signed)
         if isinstance(decl, Input):
-            inputs.append((name, width_str, bit_width))
+            inputs.append(entry)
         elif isinstance(decl, Output):
-            outputs.append((name, width_str, bit_width))
+            outputs.append(entry)
     return inputs, outputs
 
 
@@ -95,95 +98,95 @@ def generate_all_combinations(inputs, clk_name):
     return names, combos
 
 def generate_testbench(module_name, inputs, outputs):
-    """
-    Generate a Verilog testbench for 'module_name'.
-    - inputs:  list of (name, width_str, bit_width)
-    - outputs: list of (name, width_str, bit_width)
-    """
     tb = []
-    clk = next((n for n,_,_ in inputs if 'clk' in n.lower()), None)
-    rst = next((n for n,_,_ in inputs if 'rst' in n.lower()), None)
+    clk = next((n for n,_,_,_ in inputs if 'clk' in n.lower()), None)
+    rst = next((n for n,_,_,_ in inputs if 'rst' in n.lower()), None)
 
-    # Header
+    # Header & declarations
     tb.append("`timescale 1ns/1ps")
     tb.append(f"module {module_name}_tb;")
-    tb.append("    // Declare regs for inputs and wires for outputs")
-
-    # Declarations
-    for name, wstr, bw in inputs:
-        if name == clk or name == rst:
+    for name, wstr, bw, signed in inputs:
+        if name in (clk, rst):
             tb.append(f"    reg {name};")
         else:
             decl = f"reg {wstr} {name};".replace("  ", " ")
             tb.append(f"    {decl}")
-
-    for name, wstr, bw in outputs:
+    for name, wstr, bw, signed in outputs:
         decl = f"wire {wstr} {name};".replace("  ", " ")
         tb.append(f"    {decl}")
+    tb.append("")
 
-    tb.append("")  # blank line
-
-    # Instantiate
-    tb.append("    // Instantiate DUT")
+    # DUT instantiation
     tb.append(f"    {module_name} uut (")
-    port_conns = []
-    for name,_,_ in inputs + outputs:
-        port_conns.append(f"        .{name}({name})")
-    for idx, conn in enumerate(port_conns):
-        comma = "," if idx < len(port_conns) - 1 else ""
-        tb.append(f"{conn}{comma}")
+    conns = [f"        .{n}({n})" for n,_,_,_ in inputs + outputs]
+    for i, line in enumerate(conns):
+        comma = "," if i < len(conns)-1 else ""
+        tb.append(line + comma)
     tb.append("    );\n")
 
-    # Clock
+    # Clock & reset
     if clk:
-        tb.append("    // Clock generation")
-        tb.append(f"    initial {clk} = 0;")
-        tb.append(f"    always #5 {clk} = ~{clk};\n")
-
-    # Reset
+        tb += [
+            "    // Clock generation",
+            f"    initial {clk} = 0;",
+            f"    always #5 {clk} = ~{clk};\n"
+        ]
     if rst:
-        tb.append("    // Reset sequence")
-        tb.append("    initial begin")
-        tb.append(f"        {rst} = 1;")
-        tb.append("        #10;")
-        tb.append(f"        {rst} = 0;")
-        tb.append("    end\n")
+        tb += [
+            "    // Reset sequence",
+            "    initial begin",
+            f"        {rst} = 1; #10; {rst} = 0;",
+            "    end\n"
+        ]
 
     # Stimulus
     tb.append("    // Input stimulus")
     tb.append("    initial begin")
-    # initialize
-    for name,_,_ in inputs:
+    for name,_,_,_ in inputs:
         if name not in (clk, rst):
             tb.append(f"        {name} = 0;")
     tb.append("        #10;")
 
-    # generate combinations
-    test_ports = [(n, wstr, bw) for n,wstr,bw in inputs if n not in (clk, rst)]
-    # total bits
-    total_bits = sum(bw for _,_,bw in test_ports)
+    # Build test_ports list
+    test_ports = [(n, bw, signed) for (n,_,bw,signed) in inputs if n not in (clk, rst)]
+    total_bits = sum(bw for _,bw,_ in test_ports)
+
+    # Exhaustive vs random
     if total_bits <= 12:
-        # exhaustive
-        from itertools import product
-        ranges = [range(2**bw) for _,_,bw in test_ports]
-        names = [n for n,_,_ in test_ports]
+        # Exhaustive signed‑aware ranges
+        ranges = []
+        names  = []
+        for n, bw, signed in test_ports:
+            names.append(n)
+            if signed:
+                lo = -(2**(bw-1))
+                hi =  2**(bw-1) - 1
+            else:
+                lo, hi = 0, 2**bw - 1
+            ranges.append(range(lo, hi+1))
         for combo in product(*ranges):
             for n,v in zip(names, combo):
                 tb.append(f"        {n} = {v};")
             tb.append("        #10;")
     else:
-        # fallback random sampling
+        # Warn if any signed port is present
+        if any(signed for _,_,signed in test_ports):
+            tb.append(f"        // [WARN] Signed ports present: random stimulus will omit negative values")
         tb.append("        // Too many combinations; random sampling")
         tb.append("        repeat (16) begin")
-        for n,_,bw in test_ports:
-            tb.append(f"            {n} = $random % (1<<{bw});")
+        for n, bw, signed in test_ports:
+            if signed:
+                tb.append(f"            {n} = $random % (1<<{bw}); // only non‑negative")
+            else:
+                tb.append(f"            {n} = $random % (1<<{bw});")
         tb.append("            #10;")
         tb.append("        end")
 
-    tb.append("        $finish;")
-    tb.append("    end")
-    tb.append("endmodule")
-
+    tb += [
+        "        $finish;",
+        "    end",
+        "endmodule"
+    ]
     return "\n".join(tb)
 
 

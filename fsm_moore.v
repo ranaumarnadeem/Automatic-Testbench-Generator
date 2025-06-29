@@ -31,14 +31,12 @@ endmodule
 // ---- Auto-generated testbench ----
 `timescale 1ns/1ps
 module fsm_moore_tb;
-    // Declare regs for inputs and wires for outputs
     reg clk;
     reg rst;
     reg in;
     wire [1:0] state;
     wire out;
 
-    // Instantiate DUT
     fsm_moore uut (
         .clk(clk),
         .rst(rst),
@@ -53,9 +51,7 @@ module fsm_moore_tb;
 
     // Reset sequence
     initial begin
-        rst = 1;
-        #10;
-        rst = 0;
+        rst = 1; #10; rst = 0;
     end
 
     // Input stimulus
