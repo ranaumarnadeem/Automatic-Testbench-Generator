@@ -9,6 +9,7 @@ import sys
 import itertools
 from pyverilog.vparser.parser import parse, ParseError
 from pyverilog.vparser.ast import ModuleDef, Ioport, Input, Output
+from senstivity_check import check_sensitivity, report_warnings
 
 def parse_verilog(filename):
     print(f"[DEBUG] Parsing Verilog file: {filename}")
@@ -50,35 +51,30 @@ def extract_parameters(module):
 
 def resolve_width(width_node, params):
     if width_node is None:
-        return ""
+        return "", 1
     try:
         msb = eval(width_node.msb.value, {}, params)
         lsb = eval(width_node.lsb.value, {}, params)
-        w = abs(msb - lsb) + 1
-        print(f"[DEBUG] Resolved width [{msb}:{lsb}] → {w} bits")
-        return w
-    except Exception as e:
-        print(f"[WARN] Could not resolve width node '{width_node}': {e}")
-        return 1
+        bw = abs(msb - lsb) + 1
+        return f"[{msb}:{lsb}]", bw
+    except Exception:
+        return "", 1
+
 
 def extract_ports(module, params):
-    print(f"[DEBUG] Extracting ports from module '{module.name}'")
     inputs = []
     outputs = []
-    try:
-        for item in module.portlist.ports:
-            decl = item.first
-            name = decl.name
-            width = resolve_width(decl.width, params)
-            if isinstance(decl, Input):
-                inputs.append((name, width))
-                print(f"  [INPUT ] {name} : {width} bits")
-            elif isinstance(decl, Output):
-                outputs.append((name, width))
-                print(f"  [OUTPUT] {name} : {width} bits")
-    except Exception as e:
-        print(f"[ERROR] Failed in extract_ports: {e}")
+    for port in module.portlist.ports:
+        decl = port.first
+        name = decl.name
+        # resolve_width now returns (width_str, bit_width)
+        width_str, bit_width = resolve_width(decl.width, params)
+        if isinstance(decl, Input):
+            inputs.append((name, width_str, bit_width))
+        elif isinstance(decl, Output):
+            outputs.append((name, width_str, bit_width))
     return inputs, outputs
+
 
 def generate_all_combinations(inputs, clk_name):
     print("[DEBUG] Generating exhaustive combinations...")
@@ -99,64 +95,97 @@ def generate_all_combinations(inputs, clk_name):
     return names, combos
 
 def generate_testbench(module_name, inputs, outputs):
-    print(f"[DEBUG] Generating testbench for '{module_name}'")
-    try:
-        clk = next((n for n, _ in inputs if 'clk' in n.lower()), None)
-        rst = next((n for n, _ in inputs if 'rst' in n.lower()), None)
+    """
+    Generate a Verilog testbench for 'module_name'.
+    - inputs:  list of (name, width_str, bit_width)
+    - outputs: list of (name, width_str, bit_width)
+    """
+    tb = []
+    clk = next((n for n,_,_ in inputs if 'clk' in n.lower()), None)
+    rst = next((n for n,_,_ in inputs if 'rst' in n.lower()), None)
 
-        lines = ["`timescale 1ns/1ps", f"module {module_name}_tb;"]
+    # Header
+    tb.append("`timescale 1ns/1ps")
+    tb.append(f"module {module_name}_tb;")
+    tb.append("    // Declare regs for inputs and wires for outputs")
 
-        # Declarations
-        for name, width in inputs:
-            decl = f"reg [{'{}:0'.format(width-1)}] {name};" if width>1 else f"reg {name};"
-            lines.append("    " + decl)
-        for name, width in outputs:
-            decl = f"wire [{'{}:0'.format(width-1)}] {name};" if width>1 else f"wire {name};"
-            lines.append("    " + decl)
-
-        lines.append("")
-        # Instantiation
-        lines.append(f"    {module_name} uut (")
-        conns = []
-        for name, _ in inputs+outputs:
-            conns.append(f"        .{name}({name})")
-        lines.append(",\n".join(conns))
-        lines.append("    );")
-
-        # Clock/reset
-        if clk:
-            lines += ["", "    initial " + clk + " = 0;", f"    always #5 {clk} = ~{clk};"]
-        if rst:
-            lines += ["", "    initial begin", f"        {rst} = 1; #10; {rst} = 0;", "    end"]
-
-        # Stimulus
-        lines += ["", "    initial begin"]
-        for name, _ in inputs:
-            if name not in (clk, rst):
-                lines.append(f"        {name} = 0;")
-        lines.append("        #10;")
-
-        names, combos = generate_all_combinations(inputs, clk)
-        if combos is None:
-            lines += ["        // fallback random stimulus", "        repeat(16) begin"]
-            for name, width in inputs:
-                if name in (clk, rst):
-                    continue
-                lines.append(f"            {name} = $random % {2**width};")
-            lines += ["            #10;", "        end"]
+    # Declarations
+    for name, wstr, bw in inputs:
+        if name == clk or name == rst:
+            tb.append(f"    reg {name};")
         else:
-            for combo in combos:
-                for name, val in zip(names, combo):
-                    lines.append(f"        {name} = {val};")
-                lines.append("        #10;")
+            decl = f"reg {wstr} {name};".replace("  ", " ")
+            tb.append(f"    {decl}")
 
-        lines += ["        $finish;", "    end", "endmodule"]
-        tb = "\n".join(lines)
-        print("[DEBUG] Testbench generation complete.")
-        return tb
-    except Exception as e:
-        print(f"[ERROR] Exception in generate_testbench: {e}")
-        return "// ERROR generating testbench"
+    for name, wstr, bw in outputs:
+        decl = f"wire {wstr} {name};".replace("  ", " ")
+        tb.append(f"    {decl}")
+
+    tb.append("")  # blank line
+
+    # Instantiate
+    tb.append("    // Instantiate DUT")
+    tb.append(f"    {module_name} uut (")
+    port_conns = []
+    for name,_,_ in inputs + outputs:
+        port_conns.append(f"        .{name}({name})")
+    for idx, conn in enumerate(port_conns):
+        comma = "," if idx < len(port_conns) - 1 else ""
+        tb.append(f"{conn}{comma}")
+    tb.append("    );\n")
+
+    # Clock
+    if clk:
+        tb.append("    // Clock generation")
+        tb.append(f"    initial {clk} = 0;")
+        tb.append(f"    always #5 {clk} = ~{clk};\n")
+
+    # Reset
+    if rst:
+        tb.append("    // Reset sequence")
+        tb.append("    initial begin")
+        tb.append(f"        {rst} = 1;")
+        tb.append("        #10;")
+        tb.append(f"        {rst} = 0;")
+        tb.append("    end\n")
+
+    # Stimulus
+    tb.append("    // Input stimulus")
+    tb.append("    initial begin")
+    # initialize
+    for name,_,_ in inputs:
+        if name not in (clk, rst):
+            tb.append(f"        {name} = 0;")
+    tb.append("        #10;")
+
+    # generate combinations
+    test_ports = [(n, wstr, bw) for n,wstr,bw in inputs if n not in (clk, rst)]
+    # total bits
+    total_bits = sum(bw for _,_,bw in test_ports)
+    if total_bits <= 12:
+        # exhaustive
+        from itertools import product
+        ranges = [range(2**bw) for _,_,bw in test_ports]
+        names = [n for n,_,_ in test_ports]
+        for combo in product(*ranges):
+            for n,v in zip(names, combo):
+                tb.append(f"        {n} = {v};")
+            tb.append("        #10;")
+    else:
+        # fallback random sampling
+        tb.append("        // Too many combinations; random sampling")
+        tb.append("        repeat (16) begin")
+        for n,_,bw in test_ports:
+            tb.append(f"            {n} = $random % (1<<{bw});")
+        tb.append("            #10;")
+        tb.append("        end")
+
+    tb.append("        $finish;")
+    tb.append("    end")
+    tb.append("endmodule")
+
+    return "\n".join(tb)
+
 
 def main():
     if len(sys.argv) != 2:
@@ -164,23 +193,55 @@ def main():
         sys.exit(1)
 
     filename = sys.argv[1]
+
+    # 1. Parse the Verilog file
     ast = parse_verilog(filename)
+
+    # 2. Locate the top module
     top = find_top_module(ast)
     if not top:
         print("[ERROR] No top module found.")
         sys.exit(1)
+    module_name = top.name
+    print(f"[INFO] Top module: '{module_name}'")
 
+    # 3. Sensitivity‑list completeness check
+    try:
+        warnings = check_sensitivity(ast, module_name)
+        if warnings:
+            print("[INFO] Sensitivity‑list checks:")
+            report_warnings(warnings)
+        else:
+            print("[INFO] All explicit sensitivity lists are complete.")
+    except Exception as e:
+        print(f"[ERROR] Sensitivity check failed: {e}")
+
+    # 4. Extract parameters
     params = extract_parameters(top)
-    inputs, outputs = extract_ports(top, params)
-    tb = generate_testbench(top.name, inputs, outputs)
+    if params:
+        print(f"[INFO] Parameters: {params}")
 
+    # 5. Extract ports (with resolved widths)
+    inputs, outputs = extract_ports(top, params)
+    print(f"[DEBUG] Inputs:  {inputs}")
+    print(f"[DEBUG] Outputs: {outputs}")
+
+    # 6. Generate the testbench code
+    tb_code = generate_testbench(module_name, inputs, outputs)
+    if tb_code.startswith("// ERROR"):
+        print("[ERROR] Testbench generation encountered an error. See above.")
+        sys.exit(1)
+
+    # 7. Append testbench to the source file
     try:
         with open(filename, 'a') as f:
             f.write("\n\n// ---- Auto-generated testbench ----\n")
-            f.write(tb)
-        print(f"[INFO] Testbench appended to {filename}")
+            f.write(tb_code)
+        print(f"[INFO] Testbench appended to '{filename}'.")
     except Exception as e:
-        print(f"[ERROR] Failed to write testbench to file: {e}")
+        print(f"[ERROR] Failed to write testbench: {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
