@@ -62,21 +62,50 @@ def resolve_width(width_node, params):
     except Exception:
         return "", 1
 
+def extract_ports(module, param_dict):
+    """Extract input and output ports, handling widths and array dimensions."""
+    def resolve_width(width_node):
+        if width_node is None:
+            return 1
+        try:
+            msb = eval(width_node.msb.value, {}, param_dict)
+            lsb = eval(width_node.lsb.value, {}, param_dict)
+            return abs(msb - lsb) + 1
+        except Exception:
+            return 1
 
-def extract_ports(module, params):
     inputs = []
     outputs = []
+
     for port in module.portlist.ports:
         decl = port.first
         name = decl.name
-        width_str, bit_width = resolve_width(decl.width, params)
-        is_signed = getattr(decl, 'signed', False)
-        entry = (name, width_str, bit_width, is_signed)
+
+        # Handle vector width
+        width = resolve_width(decl.width)
+
+        # Handle unpacked array size
+        array_size = 1
+        is_array = False
+        if hasattr(decl, 'dimensions') and decl.dimensions:
+            try:
+                dim = decl.dimensions[0]
+                msb = eval(dim.msb.value, {}, param_dict)
+                lsb = eval(dim.lsb.value, {}, param_dict)
+                array_size = abs(msb - lsb) + 1
+                is_array = True
+            except Exception:
+                pass
+
+        entry = (name, width, is_array, array_size)
+
         if isinstance(decl, Input):
             inputs.append(entry)
         elif isinstance(decl, Output):
             outputs.append(entry)
+
     return inputs, outputs
+
 
 
 def generate_all_combinations(inputs, clk_name):
@@ -97,98 +126,107 @@ def generate_all_combinations(inputs, clk_name):
     print(f"[DEBUG] Generated {len(combos)} combinations.")
     return names, combos
 
-def generate_testbench(module_name, inputs, outputs):
-    tb = []
-    clk = next((n for n,_,_,_ in inputs if 'clk' in n.lower()), None)
-    rst = next((n for n,_,_,_ in inputs if 'rst' in n.lower()), None)
+def generate_testbench(module_name, inputs, outputs, parameters=None):
+    tb_name = f"{module_name}_tb"
+    lines = []
+    lines.append("`timescale 1ns/1ps")
+    lines.append(f"module {tb_name};")
+    lines.append("    // Declare regs for inputs and wires for outputs")
 
-    # Header & declarations
-    tb.append("`timescale 1ns/1ps")
-    tb.append(f"module {module_name}_tb;")
-    for name, wstr, bw, signed in inputs:
-        if name in (clk, rst):
-            tb.append(f"    reg {name};")
+    clk_name = next((n for n, _, _, _ in inputs if 'clk' in n.lower()), None)
+    rst_name = next((n for n, _, _, _ in inputs if 'rst' in n.lower()), None)
+
+    # Declare inputs
+    for name, width, is_array, dim in inputs:
+        decl = "reg"
+        if width > 1:
+            decl += f" [{width-1}:0]"
+        if is_array:
+            decl += f" {name} [0:{dim-1}];"
         else:
-            decl = f"reg {wstr} {name};".replace("  ", " ")
-            tb.append(f"    {decl}")
-    for name, wstr, bw, signed in outputs:
-        decl = f"wire {wstr} {name};".replace("  ", " ")
-        tb.append(f"    {decl}")
-    tb.append("")
+            decl += f" {name};"
+        lines.append(f"    {decl}")
 
-    # DUT instantiation
-    tb.append(f"    {module_name} uut (")
-    conns = [f"        .{n}({n})" for n,_,_,_ in inputs + outputs]
-    for i, line in enumerate(conns):
-        comma = "," if i < len(conns)-1 else ""
-        tb.append(line + comma)
-    tb.append("    );\n")
+    # Declare outputs
+    for name, width, is_array, dim in outputs:
+        decl = "wire"
+        if width > 1:
+            decl += f" [{width-1}:0]"
+        if is_array:
+            decl += f" {name} [0:{dim-1}];"
+        else:
+            decl += f" {name};"
+        lines.append(f"    {decl}")
 
-    # Clock & reset
-    if clk:
-        tb += [
-            "    // Clock generation",
-            f"    initial {clk} = 0;",
-            f"    always #5 {clk} = ~{clk};\n"
-        ]
-    if rst:
-        tb += [
-            "    // Reset sequence",
-            "    initial begin",
-            f"        {rst} = 1; #10; {rst} = 0;",
-            "    end\n"
-        ]
+    lines.append("")
+    lines.append("    // Instantiate the DUT")
+    if parameters:
+        param_strs = [f".{pname}({pval})" for pname, pval in parameters.items()]
+        lines.append(f"    {module_name} #(")
+        for i, p in enumerate(param_strs):
+            lines.append(f"        {p}{',' if i < len(param_strs)-1 else ''}")
+        lines.append(f"    ) uut (")
+    else:
+        lines.append(f"    {module_name} uut (")
+
+    # Connections
+    port_conns = []
+    for name, _, _, _ in inputs + outputs:
+        port_conns.append(f"        .{name}({name})")
+    for i, conn in enumerate(port_conns):
+        lines.append(conn + ("," if i < len(port_conns) - 1 else ""))
+    lines.append(f"    );\n")
+
+    # Clock gen
+    if clk_name:
+        lines.append("    // Clock generation")
+        lines.append(f"    initial {clk_name} = 0;")
+        lines.append(f"    always #5 {clk_name} = ~{clk_name};")
+        lines.append("")
+
+    # Reset logic
+    if rst_name:
+        lines.append("    // Reset sequence")
+        lines.append(f"    initial begin")
+        lines.append(f"        {rst_name} = 1;")
+        lines.append(f"        #10;")
+        lines.append(f"        {rst_name} = 0;")
+        lines.append(f"    end\n")
 
     # Stimulus
-    tb.append("    // Input stimulus")
-    tb.append("    initial begin")
-    for name,_,_,_ in inputs:
-        if name not in (clk, rst):
-            tb.append(f"        {name} = 0;")
-    tb.append("        #10;")
+    lines.append("    // Stimulus")
+    lines.append("    initial begin")
+    for name, width, is_array, dim in inputs:
+        if name in [clk_name, rst_name]:
+            continue
+        if is_array:
+            for i in range(dim):
+                lines.append(f"        {name}[{i}] = 0;")
+        else:
+            lines.append(f"        {name} = 0;")
+    lines.append("        #10;")
 
-    # Build test_ports list
-    test_ports = [(n, bw, signed) for (n,_,bw,signed) in inputs if n not in (clk, rst)]
-    total_bits = sum(bw for _,bw,_ in test_ports)
+    # Stimulus loop
+    lines.append("        // Example stimulus pattern")
+    lines.append("        integer i;")
+    lines.append("        for (i = 0; i < 4; i = i + 1) begin")
+    for name, width, is_array, dim in inputs:
+        if name in [clk_name, rst_name]:
+            continue
+        if is_array:
+            for j in range(dim):
+                val = f"(i + {j}) % {2**width}" if width else f"(i + {j})"
+                lines.append(f"            {name}[{j}] = {val};")
+        else:
+            val = f"i % {2**width}" if width else "i"
+            lines.append(f"            {name} = {val};")
+    lines.append("            #10;")
+    lines.append("        end")
+    lines.append("        $finish;")
+    lines.append("    end")
+    lines.append("endmodule")
 
-    # Exhaustive vs random
-    if total_bits <= 12:
-        # Exhaustive signed‑aware ranges
-        ranges = []
-        names  = []
-        for n, bw, signed in test_ports:
-            names.append(n)
-            if signed:
-                lo = -(2**(bw-1))
-                hi =  2**(bw-1) - 1
-            else:
-                lo, hi = 0, 2**bw - 1
-            ranges.append(range(lo, hi+1))
-        for combo in product(*ranges):
-            for n,v in zip(names, combo):
-                tb.append(f"        {n} = {v};")
-            tb.append("        #10;")
-    else:
-        # Warn if any signed port is present
-        if any(signed for _,_,signed in test_ports):
-            tb.append(f"        // [WARN] Signed ports present: random stimulus will omit negative values")
-        tb.append("        // Too many combinations; random sampling")
-        tb.append("        repeat (16) begin")
-        for n, bw, signed in test_ports:
-            if signed:
-                tb.append(f"            {n} = $random % (1<<{bw}); // only non‑negative")
-            else:
-                tb.append(f"            {n} = $random % (1<<{bw});")
-        tb.append("            #10;")
-        tb.append("        end")
-
-    tb += [
-        "        $finish;",
-        "    end",
-        "endmodule"
-    ]
-    return "\n".join(tb)
-
+    return "\n".join(lines)
 
 def main():
     if len(sys.argv) != 2:
