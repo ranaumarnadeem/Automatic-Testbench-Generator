@@ -1,55 +1,145 @@
-module fsm_example (
+module counter4 (
     input clk,
     input rst,
-    input in,
-    output reg [1:0] state
+    input [3:0] en,
+    output reg [3:0] out
 );
-    parameter IDLE = 2'b00, S1 = 2'b01, S2 = 2'b10;
-
     always @(posedge clk or posedge rst) begin
         if (rst)
-            state <= IDLE;
-        else begin
-            case (state)
-                IDLE: if (in) state <= S1;
-                S1:   if (!in) state <= S2;
-                S2:   state <= IDLE;
-            endcase
-        end
+            out <= 0;
+        else if (en)
+            out <= out + 1;
     end
 endmodule
 
 
 // ---- Auto-generated testbench ----
 `timescale 1ns/1ps
-module fsm_example_tb;
+module counter4_tb;
+    // Declare regs for inputs and wires for outputs
     reg clk;
     reg rst;
-  reg in;
-  wire [1:0] state;
+  reg [3:0] en;
+  wire [3:0] out;
 
-    fsm_example uut (
+    // Instantiate the DUT
+    counter4 uut (
         .clk(clk),
         .rst(rst),
-        .in(in),
-        .state(state)
+        .en(en),
+        .out(out)
     );
 
+    // Clock generation
     initial clk = 0;
     always #5 clk = ~clk;
 
+    // Reset sequence
     initial begin
         rst = 1;
         #10;
         rst = 0;
     end
 
+    // Input stimulus
     initial begin
-        in = 0;
+        en = 0;
         #10;
-        in = 0;
+        rst = 0;
+        en = 0;
         #10;
-        in = 1;
+        rst = 0;
+        en = 1;
+        #10;
+        rst = 0;
+        en = 2;
+        #10;
+        rst = 0;
+        en = 3;
+        #10;
+        rst = 0;
+        en = 4;
+        #10;
+        rst = 0;
+        en = 5;
+        #10;
+        rst = 0;
+        en = 6;
+        #10;
+        rst = 0;
+        en = 7;
+        #10;
+        rst = 0;
+        en = 8;
+        #10;
+        rst = 0;
+        en = 9;
+        #10;
+        rst = 0;
+        en = 10;
+        #10;
+        rst = 0;
+        en = 11;
+        #10;
+        rst = 0;
+        en = 12;
+        #10;
+        rst = 0;
+        en = 13;
+        #10;
+        rst = 0;
+        en = 14;
+        #10;
+        rst = 0;
+        en = 15;
+        #10;
+        rst = 1;
+        en = 0;
+        #10;
+        rst = 1;
+        en = 1;
+        #10;
+        rst = 1;
+        en = 2;
+        #10;
+        rst = 1;
+        en = 3;
+        #10;
+        rst = 1;
+        en = 4;
+        #10;
+        rst = 1;
+        en = 5;
+        #10;
+        rst = 1;
+        en = 6;
+        #10;
+        rst = 1;
+        en = 7;
+        #10;
+        rst = 1;
+        en = 8;
+        #10;
+        rst = 1;
+        en = 9;
+        #10;
+        rst = 1;
+        en = 10;
+        #10;
+        rst = 1;
+        en = 11;
+        #10;
+        rst = 1;
+        en = 12;
+        #10;
+        rst = 1;
+        en = 13;
+        #10;
+        rst = 1;
+        en = 14;
+        #10;
+        rst = 1;
+        en = 15;
         #10;
         $finish;
     end

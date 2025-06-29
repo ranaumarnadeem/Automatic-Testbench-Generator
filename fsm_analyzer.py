@@ -1,112 +1,72 @@
-from pyverilog.vparser.parser import parse
-from pyverilog.vparser.ast import Always, CaseStatement, Case, Identifier, BlockingSubstitution, IfStatement
+#!/usr/bin/env python3
+"""
+fsm_analyzer.py: Detect FSMs in a Verilog file using Pyverilog AST.
+Usage: python3 fsm_analyzer.py design.v
+"""
 
+import sys
+from pyverilog.vparser.parser import parse, ParseError
+from pyverilog.vparser.ast import ModuleDef, Always, CaseStatement, Identifier
 
-def extract_fsms(ast):
-    """
-    Extract FSM-like structures from Verilog AST.
-    Looks for 'always' blocks with 'case (state)' style patterns.
-    Returns a list of FSMs with state transitions.
-    """
-    fsms = []
-    definitions = ast.description.definitions
-
-    for module in definitions:
-        for item in module.items:
-            if isinstance(item, Always):
-                fsm_info = parse_always_block(item)
-                if fsm_info:
-                    fsms.append(fsm_info)
-
-    return fsms
-
-
-def parse_always_block(always_node):
-    """
-    Attempt to parse an always block to find FSM patterns.
-    Look for case statements over a 'state' variable.
-    """
-    senslist = always_node.sens_list
-    statement = always_node.statement
-
-    if isinstance(statement, CaseStatement):
-        return parse_case_fsm(statement)
-
-    # Handle nested blocks like: always @(*) begin ... case(state) ... end
-    elif hasattr(statement, 'statements'):
-        for stmt in statement.statements:
-            if isinstance(stmt, CaseStatement):
-                return parse_case_fsm(stmt)
-    return None
-
-
-def parse_case_fsm(case_stmt):
-    """
-    Extract FSM info from case statement.
-    """
-    fsm = {
-        'state_var': '',
-        'states': {},  # key: state name, value: list of transitions
-    }
-
-    if isinstance(case_stmt.comp, Identifier):
-        fsm['state_var'] = case_stmt.comp.name
-
-    for case in case_stmt.caselist:
-        if not case.exprs:
-            continue
-        state_expr = case.exprs[0]
-        state_name = state_expr.value if hasattr(state_expr, 'value') else str(state_expr)
-        transitions = []
-
-        if hasattr(case.statement, 'statements'):
-            for stmt in case.statement.statements:
-                if isinstance(stmt, IfStatement):
-                    cond = stmt.cond
-                    body = stmt.then
-                    target = extract_state_assignment(body)
-                    if target:
-                        transitions.append((cond, target))
-                elif isinstance(stmt, BlockingSubstitution):
-                    target = extract_state_assignment(stmt)
-                    if target:
-                        transitions.append(("1'b1", target))  # unconditional
-
-        fsm['states'][state_name] = transitions
-
-    return fsm
-
-
-def extract_state_assignment(stmt):
-    """
-    Extract the target state from a BlockingSubstitution like: state = IDLE;
-    """
-    if isinstance(stmt, BlockingSubstitution):
-        if isinstance(stmt.left, Identifier) and isinstance(stmt.right, Identifier):
-            return stmt.right.name
-    elif hasattr(stmt, 'statements'):
-        for sub in stmt.statements:
-            if isinstance(sub, BlockingSubstitution):
-                return extract_state_assignment(sub)
-    return None
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) != 2:
-        print("Usage: python3 fsm_analyzer.py design.v")
+def parse_verilog(filename):
+    print(f"[FSM] Parsing file: {filename}")
+    try:
+        ast, _ = parse([filename])
+        print("[FSM] Parse successful.")
+        return ast
+    except ParseError as e:
+        print(f"[FSM][ERROR] ParseError: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[FSM][ERROR] Unexpected error: {e}")
         sys.exit(1)
 
-    ast, _ = parse([sys.argv[1]])
-    fsms = extract_fsms(ast)
+def find_modules(ast):
+    return [d for d in ast.description.definitions if isinstance(d, ModuleDef)]
 
-    if not fsms:
-        print("No FSMs found.")
-    else:
-        for i, fsm in enumerate(fsms):
-            print(f"FSM {i+1} with state variable: {fsm['state_var']}")
-            for state, transitions in fsm['states'].items():
-                print(f"  State {state}:")
-                for cond, target in transitions:
-                    cond_str = cond.to_verilog() if hasattr(cond, 'to_verilog') else str(cond)
-                    print(f"    if ({cond_str}) -> {target}")
+def analyze_fsm(module):
+    print(f"[FSM] Analyzing module '{module.name}'")
+    transitions = {}
+    try:
+        for item in module.items:
+            if isinstance(item, Always):
+                cond = item.sens_list
+                # look for CaseStatement inside
+                for stmt in item.statement.statements or []:
+                    if isinstance(stmt, CaseStatement):
+                        var = stmt.comp  # Identifier of state signal
+                        state_name = var.name if isinstance(var, Identifier) else str(var)
+                        transitions[state_name] = []
+                        for case in stmt.caselist:
+                            case_val = case.value.value
+                            for inner in case.statement.statements:
+                                # look for non-blocking assigns to detect next-state
+                                if hasattr(inner, 'right') and hasattr(inner, 'left'):
+                                    ns = inner.left.var.name
+                                    transitions[state_name].append((case_val, ns))
+        print(f"[FSM] Found transitions: {transitions}")
+    except Exception as e:
+        print(f"[FSM][ERROR] Exception in analyze_fsm: {e}")
+    return transitions
+
+def main():
+    if len(sys.argv) != 2:
+        print("[FSM][ERROR] Usage: python3 fsm_analyzer.py <verilog_file>")
+        sys.exit(1)
+
+    filename = sys.argv[1]
+    ast = parse_verilog(filename)
+    modules = find_modules(ast)
+
+    for m in modules:
+        fsm = analyze_fsm(m)
+        if fsm:
+            print(f"[FSM] Module '{m.name}' transition table:")
+            for state, trans in fsm.items():
+                for val, nxt in trans:
+                    print(f"    {state} --({val})-> {nxt}")
+        else:
+            print(f"[FSM] No FSM found in '{m.name}'")
+
+if __name__ == "__main__":
+    main()
